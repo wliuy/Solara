@@ -1541,6 +1541,7 @@ async function updateDynamicBackground(imageUrl) {
 
 function savePlayerState() {
     safeSetLocalStorage("playlistSongs", JSON.stringify(state.playlistSongs));
+    scheduleSyncPlaylistToCloud(); // <-- 新增此行
     safeSetLocalStorage("currentTrackIndex", String(state.currentTrackIndex));
     safeSetLocalStorage("playMode", state.playMode);
     safeSetLocalStorage("playbackQuality", state.playbackQuality);
@@ -2391,7 +2392,140 @@ window.addEventListener("load", setupInteractions);
 if (!("mediaSession" in navigator)) {
     dom.audioPlayer.addEventListener("ended", autoPlayNext);
 }
+// [新增代码开始]
 
+let syncTimeout = null;
+let isInitializing = true; // 1. 新增：初始化标志，防止加载时就触发同步
+
+// 2. 新增：(防抖) 安排一个播放列表同步任务
+function scheduleSyncPlaylistToCloud() {
+    // 如果还在初始化，则不执行同步
+    if (isInitializing) return; 
+
+    // 如果已有定时任务，先清除
+    if (syncTimeout) {
+        clearTimeout(syncTimeout);
+    }
+
+    // 设置一个新的定时任务，在1.5秒后执行
+    syncTimeout = setTimeout(() => {
+        syncPlaylistToCloud();
+        syncTimeout = null;
+    }, 1500);
+}
+
+// 3. 新增：立即执行同步到云端
+async function syncPlaylistToCloud() {
+    if (!Array.isArray(state.playlistSongs)) {
+        return;
+    }
+
+    debugLog("正在同步播放列表到云端...");
+    try {
+        const response = await fetch('/proxy?types=save_playlist', { // [注意这里的 URL]
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            // 发送当前 state 中的播放列表
+            body: JSON.stringify(state.playlistSongs)
+        });
+
+        if (!response.ok) {
+            throw new Error(`Cloud sync failed: ${response.statusText}`);
+        }
+
+        debugLog("云端同步成功。");
+    } catch (error) {
+        debugLog(`云端同步失败: ${error.message}`);
+        showNotification("云端同步失败，请检查网络", "error");
+    }
+}
+
+// 4. 新增：从云端加载播放列表 (并在必要时合并)
+async function initializeCloudPlaylist() {
+    isInitializing = true; // 设置初始化标志
+    try {
+        debugLog("开始从云端加载播放列表...");
+        const response = await fetch('/proxy?types=get_playlist'); // [注意这里的 URL]
+
+        if (response.status === 401) {
+             console.error('未授权，无法加载云端列表。');
+             throw new Error('Unauthorized');
+        }
+
+        if (!response.ok) {
+            throw new Error(`Cloud sync error: ${response.statusText}`);
+        }
+
+        const cloudSongs = await response.json();
+
+        if (Array.isArray(cloudSongs) && cloudSongs.length > 0) {
+            // --- 云端有数据 ---
+            debugLog(`云端加载成功，获取 ${cloudSongs.length} 首歌曲。`);
+            // 关键：用云端数据覆盖本地 state
+            state.playlistSongs = cloudSongs; 
+        } else if (Array.isArray(cloudSongs) && cloudSongs.length === 0 && state.playlistSongs.length > 0) {
+            // --- 云端为空，但本地有数据 (来自 localStorage) ---
+            debugLog("云端为空，本地存在列表。正在上传本地列表到云端...");
+            // 关键：将本地数据上传到云端
+            await syncPlaylistToCloud(); 
+        } else {
+             // --- 云端和本地都为空 ---
+             debugLog("云端和本地均为空。");
+        }
+
+    } catch (error) {
+        // --- 加载失败 ---
+        debugLog(`加载云端播放列表失败: ${error.message}。将使用本地缓存。`);
+        // 出错时，自动使用 state.playlistSongs 中已从 localStorage 加载的歌曲
+    }
+
+    // --- 这是从 setupInteractions 末尾移动过来的逻辑 ---
+    // 无论加载成功还是失败，都使用 state 中最终的数据来渲染页面
+    if (state.playlistSongs.length > 0) {
+        let restoredIndex = state.currentTrackIndex;
+        if (restoredIndex < 0 || restoredIndex >= state.playlistSongs.length) {
+            restoredIndex = 0;
+        }
+
+        state.currentTrackIndex = restoredIndex;
+        state.currentPlaylist = "playlist";
+        // 渲染列表 (这会调用 savePlayerState, 但会被 isInitializing 标志阻止)
+        renderPlaylist(); 
+
+        const restoredSong = state.playlistSongs[restoredIndex];
+        if (restoredSong) {
+            state.currentSong = restoredSong;
+            updatePlaylistHighlight();
+            updateCurrentSongInfo(restoredSong).catch(error => {
+                console.error("恢复歌曲信息失败:", error);
+            });
+        }
+
+    } else {
+        dom.playlist.classList.add("empty");
+        if (dom.playlistItems) {
+            dom.playlistItems.innerHTML = "";
+        }
+        updateMobileClearPlaylistVisibility();
+        updatePlaylistActionStates();
+    }
+
+    if (state.currentSong) {
+        restoreCurrentSongState();
+    }
+
+    if (isMobileView) { 
+        initializeMobileUI();
+        updateMobileClearPlaylistVisibility();
+    }
+    // --- 移动逻辑结束 ---
+
+    isInitializing = false; // 初始化完成，允许后续的同步
+}
+
+// [新增代码结束]
 function setupInteractions() {
     function ensureQualityMenuPortal() {
         if (!dom.playerQualityMenu || !document.body || !isMobileView) {
@@ -2945,44 +3079,10 @@ function setupInteractions() {
     attachLyricScrollHandler(dom.lyricsScroll, () => dom.lyricsContent?.querySelector(".current"));
     attachLyricScrollHandler(dom.mobileInlineLyricsScroll, () => dom.mobileInlineLyricsContent?.querySelector(".current"));
 
-    updatePlaylistActionStates();
+updatePlaylistActionStates();
 
-    if (state.playlistSongs.length > 0) {
-        let restoredIndex = state.currentTrackIndex;
-        if (restoredIndex < 0 || restoredIndex >= state.playlistSongs.length) {
-            restoredIndex = 0;
-        }
-
-        state.currentTrackIndex = restoredIndex;
-        state.currentPlaylist = "playlist";
-        renderPlaylist();
-
-        const restoredSong = state.playlistSongs[restoredIndex];
-        if (restoredSong) {
-            state.currentSong = restoredSong;
-            updatePlaylistHighlight();
-            updateCurrentSongInfo(restoredSong).catch(error => {
-                console.error("恢复歌曲信息失败:", error);
-            });
-        }
-
-        savePlayerState();
-    } else {
-        dom.playlist.classList.add("empty");
-        if (dom.playlistItems) {
-            dom.playlistItems.innerHTML = "";
-        }
-        updateMobileClearPlaylistVisibility();
-    }
-
-    if (state.currentSong) {
-        restoreCurrentSongState();
-    }
-
-    if (isMobileView) {
-        initializeMobileUI();
-        updateMobileClearPlaylistVisibility();
-    }
+    // 启动云端播放列表初始化
+    initializeCloudPlaylist();
 }
 
 // 修复：更新当前歌曲信息和封面
