@@ -1,0 +1,43 @@
+name: Upstream Sync
+
+permissions:
+  contents: write
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # 每天一次
+  workflow_dispatch:
+
+jobs:
+  sync_latest_from_upstream:
+    name: Sync latest commits from upstream repo
+    runs-on: ubuntu-latest
+    if: ${{ github.event.repository.fork }}
+
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v3
+
+      - name: Sync upstream changes
+        id: sync
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+        with:
+          # ▼▼▼▼▼▼▼▼▼▼ 只需要改这下面两行 ▼▼▼▼▼▼▼▼▼▼
+          
+          # 1. 填原始仓库 (格式: 作者/项目名)
+          upstream_sync_repo: akudamatata/Solara
+          
+          # 2. 填原始分支 (注意区分 master 或 main)
+          upstream_sync_branch: main
+          
+          # ▲▲▲▲▲▲▲▲▲▲ 只需要改这上面两行 ▲▲▲▲▲▲▲▲▲▲
+
+          target_sync_branch: main
+          target_repo_token: ${{ secrets.PAT }} # 您的密钥还在，直接用
+          test_mode: false
+
+      - name: Sync check
+        if: failure()
+        run: |
+          echo "[Error] 同步失败，请检查分支名是否正确。"
+          exit 1
